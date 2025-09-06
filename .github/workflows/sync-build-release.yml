@@ -1,0 +1,161 @@
+name: Sync Fork and Build Docker Image on Upstream Release
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  packages: write
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/comfyui-docker
+
+jobs:
+  check-upstream:
+    runs-on: [self-hosted, linux, x64, homelab]
+    outputs:
+      new_version: ${{ steps.check_version.outputs.new_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Install prerequisites (jq, curl, git)
+        run: |
+          set -e
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq curl git
+          fi
+      - name: Check for New Upstream Release
+        id: check_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          LATEST_TAG=$(curl -s https://api.github.com/repos/comfyanonymous/ComfyUI/releases/latest | jq -r .tag_name)
+          CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "none")
+          if [ "$LATEST_TAG" != "$CURRENT_TAG" ]; then
+            echo "new_version=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "new_version=none" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Cleanup workspace (always, scoped)
+        if: ${{ always() }}
+        run: |
+          set -euxo pipefail
+          rm -rf "${GITHUB_WORKSPACE:?}/"* "${GITHUB_WORKSPACE:?}/."[!.]* 2>/dev/null || true
+
+  sync-and-build:
+    runs-on: [self-hosted, linux, x64, homelab]
+    needs: check-upstream
+    if: needs.check-upstream.outputs.new_version != 'none'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set Git Config
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Sync with Upstream (idempotent)
+        run: |
+          set -euo pipefail
+          URL=https://github.com/comfyanonymous/ComfyUI.git
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$URL"
+          else
+            git remote add upstream "$URL"
+          fi
+          git fetch upstream
+          git checkout master
+          git merge --no-commit --no-ff upstream/master --allow-unrelated-histories || true
+          git checkout --ours README.md
+          git add README.md
+          git commit -m "Merge upstream/master, keep local README.md" || true
+          git push origin master
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          cleanup: true
+
+      # Prepare a boolean we can safely branch on (secrets in if: can be tricky)
+      - name: Check CR_PAT secret
+        id: crpat
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.CR_PAT }}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to GHCR with GITHUB_TOKEN
+        if: ${{ steps.crpat.outputs.present == 'false' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to GHCR with CR_PAT
+        if: ${{ steps.crpat.outputs.present == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.CR_PAT }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.new_version }}
+            ${{ env.IMAGE_NAME }}:latest
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ needs.check-upstream.outputs.new_version }}
+          name: Release ${{ needs.check-upstream.outputs.new_version }}
+          body: |
+            New version synced from upstream ComfyUI.
+            Docker image: docker pull ${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.new_version }}
+          draft: false
+          prerelease: false
+
+      # Choose a token that can delete package versions (CR_PAT preferred; falls back to GITHUB_TOKEN)
+      - name: Select package cleanup token
+        id: pkg_token
+        shell: bash
+        run: |
+          if [ "${{ steps.crpat.outputs.present }}" = "true" ]; then
+            echo "token=${{ secrets.CR_PAT }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "token=${{ secrets.GITHUB_TOKEN }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Delete all untagged container package versions for this image
+      - name: Prune untagged GHCR versions
+        uses: actions/delete-package-versions@v5
+        with:
+          owner: ${{ github.repository_owner }}
+          package-name: comfyui-docker
+          package-type: container
+          min-versions-to-keep: 0
+          delete-only-untagged-versions: true
+          token: ${{ steps.pkg_token.outputs.token }}
+
+      - name: Cleanup (always, scoped)
+        if: ${{ always() }}
+        run: |
+          set -euxo pipefail
+          docker buildx prune -af || true
+          docker image prune -af --filter "until=168h" || true
+          rm -rf "${GITHUB_WORKSPACE:?}/"* "${GITHUB_WORKSPACE:?}/."[!.]* 2>/dev/null || true
