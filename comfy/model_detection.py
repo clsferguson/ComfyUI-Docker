@@ -884,6 +884,13 @@ def detect_unet_config(state_dict, key_prefix, metadata=None):
             "selected_layer_index": selected_layer_index,
         }
 
+    if '{}txt_norm.weight'.format(key_prefix) in state_dict_keys and '{}proj_out.weight'.format(key_prefix) in state_dict_keys and state_dict['{}txt_norm.weight'.format(key_prefix)].shape[0] == 2560 and state_dict['{}proj_out.weight'.format(key_prefix)].shape[0] == 128:  # Mage-Flow (Qwen Image txt_norm/proj_out are 3584/64)
+        dit_config = {}
+        dit_config["image_model"] = "mage_flow"
+        dit_config["in_channels"] = 128
+        dit_config["num_layers"] = count_blocks(state_dict_keys, '{}transformer_blocks.'.format(key_prefix) + '{}.')
+        return dit_config
+
     if '{}txt_norm.weight'.format(key_prefix) in state_dict_keys:  # Qwen Image
         dit_config = {}
         dit_config["image_model"] = "qwen_image"
@@ -1057,6 +1064,25 @@ def detect_unet_config(state_dict, key_prefix, metadata=None):
             if 'detector.backbone.vision_backbone.propagation_convs.0.conv_1x1.weight' in state_dict_keys:
                 dit_config["image_model"] = "SAM31"
             return dit_config
+
+    if (
+        '{}double_blocks.0.attn.img_attn_qkv.weight'.format(key_prefix) in state_dict_keys
+        and '{}double_blocks.0.attn.img_attn_q_norm.weight'.format(key_prefix) in state_dict_keys
+        and '{}condition_embedder.time_embedder.linear_1.weight'.format(key_prefix) in state_dict_keys
+        and '{}img_in.weight'.format(key_prefix) in state_dict_keys
+        and len(state_dict['{}img_in.weight'.format(key_prefix)].shape) == 5
+    ):
+        img_in = state_dict['{}img_in.weight'.format(key_prefix)]
+        head_dim = state_dict['{}double_blocks.0.attn.img_attn_q_norm.weight'.format(key_prefix)].shape[0]
+        return {
+            "image_model": "joyimage",
+            "in_channels": img_in.shape[1],
+            "hidden_size": img_in.shape[0],
+            "patch_size": list(img_in.shape[2:]),
+            "num_layers": count_blocks(state_dict_keys, '{}double_blocks.'.format(key_prefix) + '{}.'),
+            "num_attention_heads": img_in.shape[0] // head_dim,
+            "text_dim": 4096,
+        }
 
     if '{}input_blocks.0.0.weight'.format(key_prefix) not in state_dict_keys:
         return None
